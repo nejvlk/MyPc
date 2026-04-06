@@ -1,0 +1,2 @@
+Download the MyPc program only from the official repository: https://github.com/nejvlk/MyPc
+Use at your own risk. The author is not responsible for any damage caused by improper use or unofficial copies.
