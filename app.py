@@ -20,65 +20,41 @@ def save_data(file, data):
     with open(file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.get_json(force=True, silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    email = data.get("email", "").strip()
-    phone = data.get("phone", "").strip()
-    is_admin = data.get("is_admin", False)
-
-    if not username or not password:
-        return jsonify({"status": "error", "message": "Chybí jméno nebo heslo"}), 400
-
-    users = load_data(DB_FILE, {})
-    for u_name, u_info in users.items():
-        if u_name.lower() == username.lower():
-            return jsonify({"status": "error", "message": "Jméno již existuje"}), 409
-
-    users[username] = {
-        "password": password, 
-        "email": email, 
-        "phone": phone, 
-        "is_admin": is_admin,
-        "banned": False
-    }
-    save_data(DB_FILE, users)
-    return jsonify({"status": "success"}), 200
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json(force=True, silent=True) or {}
-    login_id = data.get("login_id", "").strip().lower()
-    password = data.get("password", "")
-
-    users = load_data(DB_FILE, {})
-    for u_name, u_info in users.items():
-        if login_id in [u_name.lower(), u_info.get("email", "").lower(), u_info.get("phone", "")]:
-            if u_info.get("banned", False):
-                return jsonify({"status": "error", "message": "Tento účet byl zablokován správcem (BAN)!"}), 403
-            if u_info["password"] == password:
-                return jsonify({
-                    "status": "success", 
-                    "username": u_name,
-                    "is_admin": u_info.get("is_admin", False)
-                }), 200
-            return jsonify({"status": "error", "message": "Špatné heslo"}), 401
-
-    return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
-
 @app.route('/admin/toggle-ban', methods=['POST'])
 def toggle_ban():
     data = request.get_json(force=True, silent=True) or {}
     user_target = data.get("user")
+    if not user_target:
+        return jsonify({"status": "error", "message": "Chybí user"}), 400
+
     users = load_data(DB_FILE, {})
     if user_target in users:
-        current_status = users[user_target].get("banned", False)
-        users[user_target]["banned"] = not current_status
+        curr = users[user_target].get("banned", False)
+        users[user_target]["banned"] = not curr
         save_data(DB_FILE, users)
-        return jsonify({"status": "success", "banned": not current_status}), 200
-    return jsonify({"status": "error"}), 404
+        return jsonify({"status": "success", "banned": not curr}), 200
+    else:
+        # Pokud je uživatel zatím jen na VIP, založíme mu záznam i sem jako zabanovaný
+        users[user_target] = {"banned": True, "password": "sync", "email": "", "phone": ""}
+        save_data(DB_FILE, users)
+        return jsonify({"status": "success", "banned": True}), 200
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json(force=True, silent=True) or {}
+    login_id = str(data.get("login_id", "")).strip().lower()
+    password = data.get("password", "")
+
+    users = load_data(DB_FILE, {})
+    for u_name, u_info in users.items():
+        if login_id in [u_name.lower(), str(u_info.get("email", "")).lower(), str(u_info.get("phone", ""))]:
+            if u_info.get("banned", False):
+                return jsonify({"status": "banned", "message": "BANNED"}), 403
+            if u_info.get("password") == password:
+                return jsonify({"status": "success", "username": u_name, "is_admin": u_info.get("is_admin", False)}), 200
+            return jsonify({"status": "error", "message": "Špatné heslo"}), 401
+
+    return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
 
 @app.route('/activate-pm', methods=['POST'])
 def activate_pm():
