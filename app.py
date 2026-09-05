@@ -4,70 +4,84 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-FREE_USERS_FILE = "free_users.json"
-PENDING_CARDS_FILE = "pending_cards.json"
+DB_FILE = "free_users.json"
+PENDING_FILE = "pending_payments.json"
 
-def load_json(file, default):
+def load_data(file, default):
     if os.path.exists(file):
-        with open(file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return default
 
-def save_json(file, data):
+def save_data(file, data):
     with open(file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-free_users_db = load_json(FREE_USERS_FILE, {})
-pending_cards = load_json(PENDING_CARDS_FILE, [])
-
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.get_json() or {}
-    user = data.get('username')
-    pwd = data.get('password')
+    data = request.get_json(force=True, silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    email = data.get("email", "").strip()
+    phone = data.get("phone", "").strip()
 
-    if not user or not pwd:
-        return jsonify({"status": "error", "message": "Zadejte jméno i heslo"}), 400
-    if user in free_users_db:
-        return jsonify({"status": "error", "message": "Uživatel již existuje"}), 400
+    if not username or not password:
+        return jsonify({"status": "error", "message": "Chybí jméno nebo heslo"}), 400
 
-    free_users_db[user] = {
-        "password": pwd,
-        "premium": False,
-        "hwid": data.get("hwid", "Neznámé")
-    }
-    save_json(FREE_USERS_FILE, free_users_db)
-    return jsonify({"status": "success", "message": "Free účet vytvořen"}), 200
+    users = load_data(DB_FILE, {})
+    for u_name, u_info in users.items():
+        if u_name.lower() == username.lower():
+            return jsonify({"status": "error", "message": "Jméno již existuje"}), 409
+        if email and u_info.get("email", "").lower() == email.lower():
+            return jsonify({"status": "error", "message": "E-mail již existuje"}), 409
+        if phone and u_info.get("phone") == phone:
+            return jsonify({"status": "error", "message": "Telefon již existuje"}), 409
+
+    users[username] = {"password": password, "email": email, "phone": phone}
+    save_data(DB_FILE, users)
+    return jsonify({"status": "success"}), 200
 
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json() or {}
-    user = data.get('username')
-    pwd = data.get('password')
+    data = request.get_json(force=True, silent=True) or {}
+    login_id = data.get("login_id", "").strip().lower()
+    password = data.get("password", "")
 
-    if user in free_users_db and free_users_db[user]["password"] == pwd:
-        return jsonify({"status": "success", "premium": False, "message": "Přihlášen přes Free server"}), 200
-    
-    return jsonify({"status": "error", "message": "Špatné jméno nebo heslo"}), 401
+    users = load_data(DB_FILE, {})
+    for u_name, u_info in users.items():
+        if login_id in [u_name.lower(), u_info.get("email", "").lower(), u_info.get("phone", "")]:
+            if u_info["password"] == password:
+                return jsonify({"status": "success", "username": u_name}), 200
+            return jsonify({"status": "error", "message": "Špatné heslo"}), 401
+
+    return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
 
 @app.route('/activate-pm', methods=['POST'])
 def activate_pm():
-    data = request.get_json() or {}
-    pending_cards.append(data)
-    save_json(PENDING_CARDS_FILE, pending_cards)
-    return jsonify({"status": "success", "message": "Kód karty byl odeslán ke schválení."}), 200
+    data = request.get_json(force=True, silent=True) or {}
+    user = data.get("user")
+    code = data.get("code")
+    
+    pending = load_data(PENDING_FILE, [])
+    pending.append({"user": user, "code": code})
+    save_data(PENDING_FILE, pending)
+    return jsonify({"status": "success"}), 200
 
 @app.route('/admin/pending', methods=['POST'])
 def get_pending():
-    return jsonify({"pending": pending_cards}), 200
+    return jsonify({"status": "success", "pending": load_data(PENDING_FILE, [])}), 200
 
 @app.route('/admin/remove-pending', methods=['POST'])
 def remove_pending():
-    user_done = request.json.get("user")
-    global pending_cards
-    pending_cards = [c for c in pending_cards if c.get("user") != user_done]
-    save_json(PENDING_CARDS_FILE, pending_cards)
+    data = request.get_json(force=True, silent=True) or {}
+    user = data.get("user")
+    pending = load_data(PENDING_FILE, [])
+    pending = [p for p in pending if p.get("user") != user]
+    save_data(PENDING_FILE, pending)
     return jsonify({"status": "success"}), 200
 
 if __name__ == '__main__':
-    app.run()
+    app.run(host="0.0.0.0", port=5000)
