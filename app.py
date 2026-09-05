@@ -27,6 +27,7 @@ def register():
     password = data.get("password", "")
     email = data.get("email", "").strip()
     phone = data.get("phone", "").strip()
+    is_admin = data.get("is_admin", False)
 
     if not username or not password:
         return jsonify({"status": "error", "message": "Chybí jméno nebo heslo"}), 400
@@ -35,12 +36,14 @@ def register():
     for u_name, u_info in users.items():
         if u_name.lower() == username.lower():
             return jsonify({"status": "error", "message": "Jméno již existuje"}), 409
-        if email and u_info.get("email", "").lower() == email.lower():
-            return jsonify({"status": "error", "message": "E-mail již existuje"}), 409
-        if phone and u_info.get("phone") == phone:
-            return jsonify({"status": "error", "message": "Telefon již existuje"}), 409
 
-    users[username] = {"password": password, "email": email, "phone": phone}
+    users[username] = {
+        "password": password, 
+        "email": email, 
+        "phone": phone, 
+        "is_admin": is_admin,
+        "banned": False
+    }
     save_data(DB_FILE, users)
     return jsonify({"status": "success"}), 200
 
@@ -53,18 +56,35 @@ def login():
     users = load_data(DB_FILE, {})
     for u_name, u_info in users.items():
         if login_id in [u_name.lower(), u_info.get("email", "").lower(), u_info.get("phone", "")]:
+            if u_info.get("banned", False):
+                return jsonify({"status": "error", "message": "Tento účet byl zablokován správcem (BAN)!"}), 403
             if u_info["password"] == password:
-                return jsonify({"status": "success", "username": u_name}), 200
+                return jsonify({
+                    "status": "success", 
+                    "username": u_name,
+                    "is_admin": u_info.get("is_admin", False)
+                }), 200
             return jsonify({"status": "error", "message": "Špatné heslo"}), 401
 
     return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+
+@app.route('/admin/toggle-ban', methods=['POST'])
+def toggle_ban():
+    data = request.get_json(force=True, silent=True) or {}
+    user_target = data.get("user")
+    users = load_data(DB_FILE, {})
+    if user_target in users:
+        current_status = users[user_target].get("banned", False)
+        users[user_target]["banned"] = not current_status
+        save_data(DB_FILE, users)
+        return jsonify({"status": "success", "banned": not current_status}), 200
+    return jsonify({"status": "error"}), 404
 
 @app.route('/activate-pm', methods=['POST'])
 def activate_pm():
     data = request.get_json(force=True, silent=True) or {}
     user = data.get("user")
     code = data.get("code")
-    
     pending = load_data(PENDING_FILE, [])
     pending.append({"user": user, "code": code})
     save_data(PENDING_FILE, pending)
