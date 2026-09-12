@@ -63,12 +63,14 @@ def login():
                     "status": "success", 
                     "username": u_name, 
                     "is_admin": u_info.get("is_admin", False),
-                    "coins": u_info.get("coins", 0) # Pokud tam není, pošle 0
+                    "coins": u_info.get("coins", 0)
                 }), 200
             return jsonify({"status": "error", "message": "Špatné heslo"}), 401
     return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
 
-# ZÍSKÁVÁNÍ MINCÍ - NYNÍ 100% BEZPEČNÉ PRO STARÉ ÚČTY
+# ==========================================
+# OPRAVENÉ ZÍSKÁVÁNÍ MINCÍ - AUTO-HEAL
+# ==========================================
 @app.route('/earn-coins', methods=['POST'])
 def earn_coins():
     data = request.get_json(force=True, silent=True) or {}
@@ -76,17 +78,18 @@ def earn_coins():
     amount = data.get("amount", 0)
     
     users = load_data(DB_FILE, {})
-    if username in users:
-        # OPRAVA: Záchrana pro staré účty (vyrobí peněženku)
-        if "coins" not in users[username]:
-            users[username]["coins"] = 0
-            
-        users[username]["coins"] += amount
-        save_data(DB_FILE, users)
-        return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
-    return jsonify({"status": "error"}), 404
+    
+    # Pokud Admin účet z PythonAnywhere na Renderu vůbec neexistuje, prostě ho vyrobíme!
+    if username not in users:
+        users[username] = {"password": "synced_admin", "is_admin": True, "banned": False, "coins": 0, "vip_until": None, "vip_plus_until": None}
+        
+    if "coins" not in users[username]:
+        users[username]["coins"] = 0
+        
+    users[username]["coins"] += amount
+    save_data(DB_FILE, users)
+    return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
 
-# NÁKUP VIP+ ZA MINCE (Stojí 5000 mincí na 14 dní)
 @app.route('/buy-vip-plus', methods=['POST'])
 def buy_vip_plus():
     data = request.get_json(force=True, silent=True) or {}
@@ -94,7 +97,6 @@ def buy_vip_plus():
     users = load_data(DB_FILE, {})
     
     if username in users:
-        # OPRAVA: Záchrana pro staré účty
         if "coins" not in users[username]:
             users[username]["coins"] = 0
 
@@ -119,14 +121,17 @@ def claim_vip_trial():
         return jsonify({"status": "error", "message": "Tento PC už 3denní trial využil!"}), 403
 
     users = load_data(DB_FILE, {})
-    if username in users:
-        now = datetime.now()
-        users[username]["vip_until"] = (now + timedelta(days=3)).isoformat()
-        used_ips.setdefault("vip_trial", []).append(ip)
-        save_data(DB_FILE, users)
-        save_data(IP_DB_FILE, used_ips)
-        return jsonify({"status": "success"}), 200
-    return jsonify({"status": "error"}), 404
+    
+    # Auto-heal i pro trial
+    if username not in users:
+        users[username] = {"password": "synced", "is_admin": False, "banned": False, "coins": 0, "vip_until": None, "vip_plus_until": None}
+
+    now = datetime.now()
+    users[username]["vip_until"] = (now + timedelta(days=3)).isoformat()
+    used_ips.setdefault("vip_trial", []).append(ip)
+    save_data(DB_FILE, users)
+    save_data(IP_DB_FILE, used_ips)
+    return jsonify({"status": "success"}), 200
 
 @app.route('/admin/toggle-ban', methods=['POST'])
 def toggle_ban():
