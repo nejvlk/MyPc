@@ -36,13 +36,14 @@ def register():
 
     users[username] = {
         "password": data.get("password", ""), 
-        "email": data.get("email", ""), 
-        "phone": data.get("phone", ""), 
         "is_admin": False,
         "banned": False,
         "coins": 0,
         "vip_until": None,
-        "vip_plus_until": None
+        "vip_plus_until": None,
+        "pm_pass_until": None,
+        "multiplier_until": None,
+        "has_luck": False
     }
     save_data(DB_FILE, users)
     return jsonify({"status": "success"}), 200
@@ -56,21 +57,20 @@ def login():
     for u_name, u_info in users.items():
         if login_id in [u_name.lower(), str(u_info.get("email", "")).lower(), str(u_info.get("phone", ""))]:
             if u_info.get("banned", False):
-                return jsonify({"status": "banned", "username": u_name, "message": "BANNED"}), 403
+                return jsonify({"status": "banned"}), 403
             
             if u_info.get("password") == data.get("password", ""):
                 return jsonify({
                     "status": "success", 
                     "username": u_name, 
                     "is_admin": u_info.get("is_admin", False),
-                    "coins": u_info.get("coins", 0)
+                    "coins": u_info.get("coins", 0),
+                    "multiplier_until": u_info.get("multiplier_until"),
+                    "has_luck": u_info.get("has_luck", False)
                 }), 200
             return jsonify({"status": "error", "message": "Špatné heslo"}), 401
     return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
 
-# ==========================================
-# OPRAVENÉ ZÍSKÁVÁNÍ MINCÍ - AUTO-HEAL
-# ==========================================
 @app.route('/earn-coins', methods=['POST'])
 def earn_coins():
     data = request.get_json(force=True, silent=True) or {}
@@ -78,37 +78,49 @@ def earn_coins():
     amount = data.get("amount", 0)
     
     users = load_data(DB_FILE, {})
-    
-    # Pokud Admin účet z PythonAnywhere na Renderu vůbec neexistuje, prostě ho vyrobíme!
     if username not in users:
-        users[username] = {"password": "synced_admin", "is_admin": True, "banned": False, "coins": 0, "vip_until": None, "vip_plus_until": None}
+        users[username] = {"password": "synced", "is_admin": True, "banned": False, "coins": 0}
         
-    if "coins" not in users[username]:
-        users[username]["coins"] = 0
+    if "coins" not in users[username]: users[username]["coins"] = 0
         
     users[username]["coins"] += amount
     save_data(DB_FILE, users)
     return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
 
-@app.route('/buy-vip-plus', methods=['POST'])
-def buy_vip_plus():
+# =========================================================
+# UNIVERZÁLNÍ OBCHOD - Zvládne VIP, Funkce, Hodiny i Boosty
+# =========================================================
+@app.route('/shop-buy', methods=['POST'])
+def shop_buy():
     data = request.get_json(force=True, silent=True) or {}
     username = data.get("username")
-    users = load_data(DB_FILE, {})
+    cost = int(data.get("cost", 0))
+    item = data.get("item") # "vip_plus", "pm_pass", "multiplier", "luck"
+    duration_hours = int(data.get("duration_hours", 0))
     
-    if username in users:
-        if "coins" not in users[username]:
-            users[username]["coins"] = 0
-
-        if users[username]["coins"] >= 5000:
-            users[username]["coins"] -= 5000
-            now = datetime.now()
-            users[username]["vip_plus_until"] = (now + timedelta(days=14)).isoformat()
-            save_data(DB_FILE, users)
-            return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
+    users = load_data(DB_FILE, {})
+    if username not in users: return jsonify({"status": "error"}), 404
+    if "coins" not in users[username]: users[username]["coins"] = 0
+    
+    if users[username]["coins"] >= cost:
+        users[username]["coins"] -= cost
+        now = datetime.now()
+        
+        if item == "luck":
+            users[username]["has_luck"] = True
         else:
-            return jsonify({"status": "error", "message": "Nemáš dost mincí! Potřebuješ 5000."}), 400
-    return jsonify({"status": "error"}), 404
+            key = f"{item}_until"
+            current_exp = users[username].get(key)
+            base_time = datetime.fromisoformat(current_exp) if current_exp and datetime.fromisoformat(current_exp) > now else now
+            if duration_hours == 999999: # Doživotní
+                users[username][key] = "2099-01-01T00:00:00"
+            else:
+                users[username][key] = (base_time + timedelta(hours=duration_hours)).isoformat()
+
+        save_data(DB_FILE, users)
+        return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
+    else:
+        return jsonify({"status": "error", "message": f"Nemáš dost mincí. Chybí {cost - users[username]['coins']}!"}), 400
 
 @app.route('/claim-vip-trial', methods=['POST'])
 def claim_vip_trial():
@@ -117,32 +129,15 @@ def claim_vip_trial():
     ip = get_client_ip()
 
     used_ips = load_data(IP_DB_FILE, {})
-    if ip in used_ips.get("vip_trial", []):
-        return jsonify({"status": "error", "message": "Tento PC už 3denní trial využil!"}), 403
+    if ip in used_ips.get("vip_trial", []): return jsonify({"status": "error", "message": "Tento PC už trial využil!"}), 403
 
     users = load_data(DB_FILE, {})
-    
-    # Auto-heal i pro trial
-    if username not in users:
-        users[username] = {"password": "synced", "is_admin": False, "banned": False, "coins": 0, "vip_until": None, "vip_plus_until": None}
-
-    now = datetime.now()
-    users[username]["vip_until"] = (now + timedelta(days=3)).isoformat()
+    if username not in users: users[username] = {"password": "synced", "coins": 0}
+    users[username]["vip_until"] = (datetime.now() + timedelta(days=3)).isoformat()
     used_ips.setdefault("vip_trial", []).append(ip)
     save_data(DB_FILE, users)
     save_data(IP_DB_FILE, used_ips)
     return jsonify({"status": "success"}), 200
-
-@app.route('/admin/toggle-ban', methods=['POST'])
-def toggle_ban():
-    data = request.get_json(force=True, silent=True) or {}
-    user_target = data.get("user")
-    users = load_data(DB_FILE, {})
-    if user_target in users:
-        users[user_target]["banned"] = not users[user_target].get("banned", False)
-        save_data(DB_FILE, users)
-        return jsonify({"status": "success"}), 200
-    return jsonify({"status": "error"}), 404
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
