@@ -63,12 +63,12 @@ def login():
                     "status": "success", 
                     "username": u_name, 
                     "is_admin": u_info.get("is_admin", False),
-                    "coins": u_info.get("coins", 0)
+                    "coins": u_info.get("coins", 0) # Pokud tam není, pošle 0
                 }), 200
             return jsonify({"status": "error", "message": "Špatné heslo"}), 401
     return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
 
-# ZÍSKÁVÁNÍ MINCÍ (Z minihry nebo denní odměny)
+# ZÍSKÁVÁNÍ MINCÍ - NYNÍ 100% BEZPEČNÉ PRO STARÉ ÚČTY
 @app.route('/earn-coins', methods=['POST'])
 def earn_coins():
     data = request.get_json(force=True, silent=True) or {}
@@ -77,6 +77,10 @@ def earn_coins():
     
     users = load_data(DB_FILE, {})
     if username in users:
+        # OPRAVA: Záchrana pro staré účty (vyrobí peněženku)
+        if "coins" not in users[username]:
+            users[username]["coins"] = 0
+            
         users[username]["coins"] += amount
         save_data(DB_FILE, users)
         return jsonify({"status": "success", "coins": users[username]["coins"]}), 200
@@ -90,6 +94,10 @@ def buy_vip_plus():
     users = load_data(DB_FILE, {})
     
     if username in users:
+        # OPRAVA: Záchrana pro staré účty
+        if "coins" not in users[username]:
+            users[username]["coins"] = 0
+
         if users[username]["coins"] >= 5000:
             users[username]["coins"] -= 5000
             now = datetime.now()
