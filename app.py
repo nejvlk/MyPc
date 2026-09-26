@@ -21,8 +21,8 @@ from supabase import create_client, Client
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-SUPABASE_URL = os.environ["https://vhakeackcnfluelcllvq.supabase.co"]
-SUPABASE_KEY = os.environ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZoYWtlYWNrY25mbHVlbGNsbHZxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc5MDQwOTQwNywiZXhwIjoyMTA1OTg1NDA3fQ.gYuNoKszMKm7F3NWpaQtmCJfd795KvGf2_sAQImVZhY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TABLE = "free_users"
