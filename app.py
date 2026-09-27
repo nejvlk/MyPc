@@ -26,11 +26,19 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TABLE = "free_users"
-PROTECTED_KEYS = {"password", "is_admin", "banned"}   # tohle přes /sync-stats nikdy nejde přepsat
+
+# Heslo pro admin panel (adminpanel.py) - MUSÍ být stejné jako ADMIN_PWD tam
+# a stejné jako ADMIN_PWD na pythonanywhere.py serveru.
+ADMIN_PWD = "SuperTajneHeslo123"
+
+# Chráněná pole - přes /sync-stats je nejde přepsat (mění se jen přes vyhrazené
+# endpointy: /update-account, /shop-buy-tier, /request-admin, /request-unban, /admin/*).
+PROTECTED_KEYS = {"password", "is_admin", "banned", "admin_pending", "unban_reason"}
 
 DEFAULT_DATA = {
     "email": "", "phone": "",
     "is_admin": False, "banned": False,
+    "admin_pending": False, "unban_reason": None,
     "coins": 0.0, "level": 1, "xp": 0,
     "luck_multiplier": 1.0, "has_podkova": False,
     "daily_streak": 1, "last_daily_claim": None,
@@ -86,6 +94,11 @@ def _extend_until(d, key, hours):
     return d[key]
 
 
+def _check_admin(data):
+    """True pokud payload obsahuje správné admin_pwd. Používá se pro všechny /admin/* routy."""
+    return data.get("admin_pwd") == ADMIN_PWD
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(force=True, silent=True) or {}
@@ -104,6 +117,42 @@ def register():
         "password": data.get("password", ""),
         "data": user_data,
     }).execute()
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/request-admin", methods=["POST"])
+def request_admin():
+    """Volá appka po registraci, když uživatel zaškrtl 'Chci požádat o ADMIN účet'
+    a zadal správné potvrzovací heslo. Jen zařadí do fronty, kterou schvaluje
+    adminpanel.py v záložce 'Admin Žádosti'."""
+    data = request.get_json(force=True, silent=True) or {}
+    row = _get_row(data.get("username", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
+
+    d = row.get("data") or {}
+    if d.get("is_admin"):
+        return jsonify({"status": "success", "message": "Účet je už admin"}), 200
+
+    d["admin_pending"] = True
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/request-unban", methods=["POST"])
+def request_unban():
+    """Volá appka, když se zabanovaný uživatel odvolává."""
+    data = request.get_json(force=True, silent=True) or {}
+    row = _get_row(data.get("username", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
+
+    d = row.get("data") or {}
+    if not d.get("banned"):
+        return jsonify({"status": "error", "message": "Účet není zabanovaný"}), 400
+
+    d["unban_reason"] = str(data.get("reason", "")).strip() or "(bez uvedeného důvodu)"
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
     return jsonify({"status": "success"}), 200
 
 
@@ -192,9 +241,9 @@ def update_account():
 
 @app.route("/sync-stats", methods=["POST"])
 def sync_stats():
-    """Obecné uložení - přijme JAKÁKOLIV pole (kromě hesla/admin/ban) a uloží je
-    do sloupce 'data'. Appka tak může posílat cokoliv nového, aniž by se muselo
-    cokoliv měnit v Supabase."""
+    """Obecné uložení - přijme JAKÁKOLIV pole (kromě hesla/admin/ban/admin_pending/
+    unban_reason) a uloží je do sloupce 'data'. Appka tak může posílat cokoliv nového,
+    aniž by se muselo cokoliv měnit v Supabase."""
     data = request.get_json(force=True, silent=True) or {}
     row = _get_row(data.get("username"))
     if not row:
@@ -230,6 +279,129 @@ def caches_premium_activate():
     Premium(+) má prodávat, doplní se sem stejná logika jako v /shop-buy-tier."""
     return jsonify({"status": "not_implemented", "message": "Caches Premium/Premium Plus zatím není aktivní."}), 501
 
+
+# ===========================================================================
+# ADMIN ROUTY - volá je výhradně adminpanel.py, vždy s "admin_pwd" v těle.
+# ===========================================================================
+
+@app.route("/admin/users", methods=["POST"])
+def admin_users():
+    """Vrátí všechny Free účty (bez hesla) pro tabulku 'Všichni Uživatelé & BANY'."""
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    res = supabase.table(TABLE).select("*").execute()
+    out = {}
+    for row in res.data or []:
+        d = row.get("data") or {}
+        out[row["username"]] = {
+            "email": d.get("email", ""),
+            "phone": d.get("phone", ""),
+            "banned": bool(d.get("banned", False)),
+            "is_admin": bool(d.get("is_admin", False)),
+        }
+    return jsonify({"status": "success", "users": out}), 200
+
+
+@app.route("/admin/toggle-ban", methods=["POST"])
+def admin_toggle_ban():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+
+    d = row.get("data") or {}
+    d["banned"] = not bool(d.get("banned", False))
+    if not d["banned"]:
+        d["unban_reason"] = None
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "banned": d["banned"]}), 200
+
+
+@app.route("/admin/delete-user", methods=["POST"])
+def admin_delete_user():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+
+    supabase.table(TABLE).delete().eq("username", row["username"]).execute()
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/unban-requests", methods=["POST"])
+def admin_unban_requests():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    res = supabase.table(TABLE).select("*").execute()
+    out = {}
+    for row in res.data or []:
+        d = row.get("data") or {}
+        if d.get("banned") and d.get("unban_reason"):
+            out[row["username"]] = {"reason": d.get("unban_reason")}
+    return jsonify({"status": "success", "requests": out}), 200
+
+
+@app.route("/admin/approve-unban", methods=["POST"])
+def admin_approve_unban():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+
+    d = row.get("data") or {}
+    d["banned"] = False
+    d["unban_reason"] = None
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/admin-requests", methods=["POST"])
+def admin_admin_requests():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    res = supabase.table(TABLE).select("*").execute()
+    pending = []
+    for row in res.data or []:
+        d = row.get("data") or {}
+        if d.get("admin_pending") and not d.get("is_admin"):
+            pending.append(row["username"])
+    return jsonify({"status": "success", "requests": pending}), 200
+
+
+@app.route("/admin/approve-admin", methods=["POST"])
+def admin_approve_admin():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+
+    d = row.get("data") or {}
+    d["is_admin"] = True
+    d["admin_pending"] = False
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success"}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
