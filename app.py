@@ -35,6 +35,11 @@ ADMIN_PWD = "SuperTajneHeslo123"
 # endpointy: /update-account, /shop-buy-tier, /request-admin, /request-unban, /admin/*).
 PROTECTED_KEYS = {"password", "is_admin", "banned", "admin_pending", "unban_reason"}
 
+# Kolik hodin musí uplynout mezi dvěma odměnami za přidání úlu/hnízda (anti-spam).
+HIVE_COOLDOWN_HOURS = 24
+# Kolik kreditů (coins) appka dostane za jeden přidaný úl/hnízdo.
+HIVE_REWARD_COINS = 1.0
+
 DEFAULT_DATA = {
     "email": "", "phone": "",
     "is_admin": False, "banned": False,
@@ -46,6 +51,8 @@ DEFAULT_DATA = {
     "wolfingo_plus_until": None,           # nové - Wolfingo Plus (pomalejší varianta, tady na Supabase)
     "caches_premium_until": None,          # kostra - zatím se nikde neaktivuje
     "caches_premium_plus_until": None,     # kostra - zatím se nikde neaktivuje
+    "hives": [],                           # seznam přidaných včelích úlů/hnízd
+    "last_hive_claim": None,               # kdy naposledy dostal odměnu za úl/hnízdo (anti-spam, 1x/24h)
 }
 
 
@@ -194,6 +201,94 @@ def earn_coins():
     d["coins"] = round(float(d.get("coins", 0.0)) + float(data.get("amount", 0.0)), 2)
     supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
     return jsonify({"status": "success", "coins": d["coins"]}), 200
+
+
+@app.route("/add-hive", methods=["POST"])
+def add_hive():
+    """Přidání včelího úlu nebo hnízda appkou. Za každý přidaný úl/hnízdo se dá
+    odměna HIVE_REWARD_COINS kreditů, ale jen jednou za HIVE_COOLDOWN_HOURS hodin
+    na uživatele (anti-spam) - i kdyby appka poslala víc požadavků rychle po sobě,
+    samotný úl/hnízdo se do seznamu uloží vždycky, ale kredity se přičtou jen když
+    cooldown už uplynul.
+
+    Očekávaný JSON:
+      username (povinné)
+      type     ("ul" nebo "hnizdo", volitelné, default "ul")
+      name     (volitelný název/popisek)
+      lat, lon (volitelné souřadnice)
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    row = _get_row(data.get("username"))
+    if not row:
+        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
+    if (row.get("data") or {}).get("banned", False):
+        return jsonify({"status": "banned"}), 403
+
+    d = row.get("data") or {}
+    now = datetime.now()
+
+    # --- anti-spam kontrola cooldownu ---
+    cooldown_active = False
+    hours_left = 0
+    minutes_left = 0
+    last_claim = d.get("last_hive_claim")
+    if last_claim:
+        try:
+            last_dt = datetime.fromisoformat(last_claim)
+            elapsed = now - last_dt
+            remaining = timedelta(hours=HIVE_COOLDOWN_HOURS) - elapsed
+            if remaining.total_seconds() > 0:
+                cooldown_active = True
+                hours_left = int(remaining.total_seconds() // 3600)
+                minutes_left = int((remaining.total_seconds() % 3600) // 60)
+        except Exception:
+            pass
+
+    if cooldown_active:
+        return jsonify({
+            "status": "error",
+            "message": f"Úl/hnízdo lze odměnit jen 1x za {HIVE_COOLDOWN_HOURS}h. Zkus to za {hours_left}h {minutes_left}m.",
+            "cooldown": True,
+            "hours_left": hours_left,
+            "minutes_left": minutes_left,
+            "coins": d.get("coins", 0.0),
+        }), 429
+
+    # --- uložení úlu/hnízda a odměna ---
+    hive_type = data.get("type", "ul")  # "ul" nebo "hnizdo"
+    hive_entry = {
+        "type": hive_type,
+        "name": data.get("name", ""),
+        "lat": data.get("lat"),
+        "lon": data.get("lon"),
+        "added_at": now.isoformat(),
+    }
+
+    hives = d.get("hives") or []
+    hives.append(hive_entry)
+    d["hives"] = hives
+    d["last_hive_claim"] = now.isoformat()
+    d["coins"] = round(float(d.get("coins", 0.0)) + HIVE_REWARD_COINS, 2)
+
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({
+        "status": "success",
+        "coins": d["coins"],
+        "reward": HIVE_REWARD_COINS,
+        "hives_count": len(hives),
+        "hive": hive_entry,
+    }), 200
+
+
+@app.route("/get-hives", methods=["POST"])
+def get_hives():
+    """Vrátí seznam všech přidaných úlů/hnízd daného uživatele."""
+    data = request.get_json(force=True, silent=True) or {}
+    row = _get_row(data.get("username"))
+    if not row:
+        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
+    d = row.get("data") or {}
+    return jsonify({"status": "success", "hives": d.get("hives") or []}), 200
 
 
 @app.route("/shop-buy-tier", methods=["POST"])
@@ -399,9 +494,6 @@ def admin_approve_admin():
     supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
     return jsonify({"status": "success"}), 200
 
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
