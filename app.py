@@ -1,4 +1,6 @@
 import os
+import re
+import math
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
@@ -26,6 +28,12 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TABLE = "free_users"
+# Samostatná tabulka pro nahlášená hnízda/úly - VIDITELNÁ VŠEM uživatelům (appka je
+# přes GET /nests?lat&lon&radius_km stahuje jako "hlášení od ostatních poblíž").
+# V Supabase potřebuje sloupce: id (auto, PK), lat float8, lon float8, type text,
+# hive_type text (nullable), note text (nullable), device_id text (nullable),
+# username text (nullable), created_at timestamptz.
+TABLE_NESTS = "nests"
 
 # Heslo pro admin panel (adminpanel.py) - MUSÍ být stejné jako ADMIN_PWD tam
 # a stejné jako ADMIN_PWD na pythonanywhere.py serveru.
@@ -35,10 +43,13 @@ ADMIN_PWD = "SuperTajneHeslo123"
 # endpointy: /update-account, /shop-buy-tier, /request-admin, /request-unban, /admin/*).
 PROTECTED_KEYS = {"password", "is_admin", "banned", "admin_pending", "unban_reason"}
 
-# Kolik hodin musí uplynout mezi dvěma odměnami za přidání úlu/hnízda (anti-spam).
-HIVE_COOLDOWN_HOURS = 24
-# Kolik kreditů (coins) appka dostane za jeden přidaný úl/hnízdo.
-HIVE_REWARD_COINS = 1.0
+# Platné typy hlášení - MUSÍ odpovídat klíčům NEST_TYPES v appce (neni.py).
+NEST_TYPES_SERVER = {"vosy", "srsni", "vcely"}
+NEST_NOTE_MAX_LEN = 140
+# Kolik hodin musí uplynout mezi dvěma hlášeními/odměnami na jeden účet (anti-spam).
+NEST_COOLDOWN_HOURS = 24
+# Kolik kreditů (coins) appka dostane za jedno přidané hlášení (úl/hnízdo).
+NEST_REWARD_COINS = 1.0
 
 DEFAULT_DATA = {
     "email": "", "phone": "",
@@ -51,9 +62,18 @@ DEFAULT_DATA = {
     "wolfingo_plus_until": None,           # nové - Wolfingo Plus (pomalejší varianta, tady na Supabase)
     "caches_premium_until": None,          # kostra - zatím se nikde neaktivuje
     "caches_premium_plus_until": None,     # kostra - zatím se nikde neaktivuje
-    "hives": [],                           # seznam přidaných včelích úlů/hnízd
-    "last_hive_claim": None,               # kdy naposledy dostal odměnu za úl/hnízdo (anti-spam, 1x/24h)
+    "last_nest_claim": None,               # kdy naposledy dostal odměnu za nahlášené hnízdo/úl (anti-spam, 1x/24h)
 }
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Vzdálenost dvou bodů po povrchu Země v km - pro filtrování hnízd 'poblíž' v /nests."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _get_row(username):
@@ -203,92 +223,109 @@ def earn_coins():
     return jsonify({"status": "success", "coins": d["coins"]}), 200
 
 
-@app.route("/add-hive", methods=["POST"])
-def add_hive():
-    """Přidání včelího úlu nebo hnízda appkou. Za každý přidaný úl/hnízdo se dá
-    odměna HIVE_REWARD_COINS kreditů, ale jen jednou za HIVE_COOLDOWN_HOURS hodin
-    na uživatele (anti-spam) - i kdyby appka poslala víc požadavků rychle po sobě,
-    samotný úl/hnízdo se do seznamu uloží vždycky, ale kredity se přičtou jen když
-    cooldown už uplynul.
+@app.route("/nests", methods=["GET"])
+def nests_get():
+    """Vrátí appce hlášení hnízd/úlů poblíž zadaného bodu (GET /nests?lat=..&lon=..&radius_km=..).
+    Přesně odpovídá volání nests_fetch_nearby() v appce - appka čeká buď {"nests": [...]}
+    nebo rovnou list, a v každé položce používá jen lat/lon/type/hive_type/note."""
+    lat = request.args.get("lat", type=float)
+    lon = request.args.get("lon", type=float)
+    radius_km = request.args.get("radius_km", default=3.0, type=float)
+    if lat is None or lon is None:
+        return jsonify({"status": "error", "message": "Chybí lat/lon"}), 400
 
-    Očekávaný JSON:
-      username (povinné)
-      type     ("ul" nebo "hnizdo", volitelné, default "ul")
-      name     (volitelný název/popisek)
-      lat, lon (volitelné souřadnice)
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    row = _get_row(data.get("username"))
-    if not row:
-        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
-    if (row.get("data") or {}).get("banned", False):
-        return jsonify({"status": "banned"}), 403
-
-    d = row.get("data") or {}
-    now = datetime.now()
-
-    # --- anti-spam kontrola cooldownu ---
-    cooldown_active = False
-    hours_left = 0
-    minutes_left = 0
-    last_claim = d.get("last_hive_claim")
-    if last_claim:
+    res = supabase.table(TABLE_NESTS).select("*").execute()
+    out = []
+    for r in res.data or []:
         try:
-            last_dt = datetime.fromisoformat(last_claim)
-            elapsed = now - last_dt
-            remaining = timedelta(hours=HIVE_COOLDOWN_HOURS) - elapsed
-            if remaining.total_seconds() > 0:
-                cooldown_active = True
-                hours_left = int(remaining.total_seconds() // 3600)
-                minutes_left = int((remaining.total_seconds() % 3600) // 60)
+            r_lat, r_lon = float(r["lat"]), float(r["lon"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if _haversine_km(lat, lon, r_lat, r_lon) <= radius_km:
+            out.append({
+                "lat": r_lat,
+                "lon": r_lon,
+                "type": r.get("type"),
+                "hive_type": r.get("hive_type"),
+                "note": r.get("note"),
+            })
+    return jsonify({"nests": out}), 200
+
+
+@app.route("/nests", methods=["POST"])
+def nests_post():
+    """Uloží nové hlášení hnízda/úlu (POST /nests) - přesně odpovídá nests_submit() v appce.
+    Payload appky: lat, lon, type, hive_type, note, device_id, username (username je nepovinné,
+    appka ho posílá jen když je uživatel přihlášený/host).
+
+    Anti-spam: jde vytvořit jen 1 hlášení za NEST_COOLDOWN_HOURS hodin na účet (podle username).
+    Bez rozpoznaného účtu (neznámé/chybějící username) se aspoň omezí podle device_id.
+    Odměna NEST_REWARD_COINS kreditů se připíše jen když má appka platný, nezabanovaný účet."""
+    data = request.get_json(force=True, silent=True) or {}
+    lat, lon = data.get("lat"), data.get("lon")
+    kind = data.get("type")
+    hive_type = data.get("hive_type")
+    note = str(data.get("note") or "").strip()
+    device_id = data.get("device_id")
+    username = str(data.get("username") or "").strip() or None
+
+    if lat is None or lon is None or kind not in NEST_TYPES_SERVER:
+        return jsonify({"ok": False, "reason": "Neplatné hlášení."}), 400
+    if len(note) > NEST_NOTE_MAX_LEN:
+        return jsonify({"ok": False, "reason": "Poznámka je moc dlouhá."}), 400
+    if re.search(r"https?://|www\.", note.lower()):
+        return jsonify({"ok": False, "reason": "Odkazy v poznámce nejsou povolené."}), 400
+
+    now = datetime.now()
+    reward = None
+    row = _get_row(username) if username else None
+
+    if row:
+        if (row.get("data") or {}).get("banned", False):
+            return jsonify({"ok": False, "reason": "Účet je zabanovaný."}), 403
+
+        d = row.get("data") or {}
+        last_claim = d.get("last_nest_claim")
+        if last_claim:
+            try:
+                remaining = timedelta(hours=NEST_COOLDOWN_HOURS) - (now - datetime.fromisoformat(last_claim))
+                if remaining.total_seconds() > 0:
+                    hours_left = int(remaining.total_seconds() // 3600)
+                    minutes_left = int((remaining.total_seconds() % 3600) // 60)
+                    return jsonify({
+                        "ok": False,
+                        "reason": f"Hlášení lze poslat jen 1x za {NEST_COOLDOWN_HOURS}h. "
+                                  f"Zkus to za {hours_left}h {minutes_left}m.",
+                    }), 429
+            except Exception:
+                pass
+
+        d["last_nest_claim"] = now.isoformat()
+        d["coins"] = round(float(d.get("coins", 0.0)) + NEST_REWARD_COINS, 2)
+        supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+        reward = NEST_REWARD_COINS
+    elif device_id:
+        # neznámý/chybějící účet (host) - aspoň zabránit spamu ze stejného zařízení,
+        # bez odměny (tu nemá komu server připsat)
+        since = (now - timedelta(hours=NEST_COOLDOWN_HOURS)).isoformat()
+        try:
+            recent = (supabase.table(TABLE_NESTS).select("created_at")
+                      .eq("device_id", device_id).gte("created_at", since).limit(1).execute())
+            if recent.data:
+                return jsonify({
+                    "ok": False,
+                    "reason": f"Z tohoto zařízení lze poslat hlášení jen 1x za {NEST_COOLDOWN_HOURS}h.",
+                }), 429
         except Exception:
             pass
 
-    if cooldown_active:
-        return jsonify({
-            "status": "error",
-            "message": f"Úl/hnízdo lze odměnit jen 1x za {HIVE_COOLDOWN_HOURS}h. Zkus to za {hours_left}h {minutes_left}m.",
-            "cooldown": True,
-            "hours_left": hours_left,
-            "minutes_left": minutes_left,
-            "coins": d.get("coins", 0.0),
-        }), 429
+    supabase.table(TABLE_NESTS).insert({
+        "lat": lat, "lon": lon, "type": kind, "hive_type": hive_type,
+        "note": note or None, "device_id": device_id, "username": username,
+        "created_at": now.isoformat(),
+    }).execute()
 
-    # --- uložení úlu/hnízda a odměna ---
-    hive_type = data.get("type", "ul")  # "ul" nebo "hnizdo"
-    hive_entry = {
-        "type": hive_type,
-        "name": data.get("name", ""),
-        "lat": data.get("lat"),
-        "lon": data.get("lon"),
-        "added_at": now.isoformat(),
-    }
-
-    hives = d.get("hives") or []
-    hives.append(hive_entry)
-    d["hives"] = hives
-    d["last_hive_claim"] = now.isoformat()
-    d["coins"] = round(float(d.get("coins", 0.0)) + HIVE_REWARD_COINS, 2)
-
-    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
-    return jsonify({
-        "status": "success",
-        "coins": d["coins"],
-        "reward": HIVE_REWARD_COINS,
-        "hives_count": len(hives),
-        "hive": hive_entry,
-    }), 200
-
-
-@app.route("/get-hives", methods=["POST"])
-def get_hives():
-    """Vrátí seznam všech přidaných úlů/hnízd daného uživatele."""
-    data = request.get_json(force=True, silent=True) or {}
-    row = _get_row(data.get("username"))
-    if not row:
-        return jsonify({"status": "error", "message": "Účet nenalezen"}), 404
-    d = row.get("data") or {}
-    return jsonify({"status": "success", "hives": d.get("hives") or []}), 200
+    return jsonify({"ok": True, "reward_coins": reward}), 200
 
 
 @app.route("/shop-buy-tier", methods=["POST"])
