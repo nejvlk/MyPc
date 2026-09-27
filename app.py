@@ -225,12 +225,17 @@ def earn_coins():
 
 @app.route("/nests", methods=["GET"])
 def nests_get():
-    """Vrátí appce hlášení hnízd/úlů poblíž zadaného bodu (GET /nests?lat=..&lon=..&radius_km=..).
-    Přesně odpovídá volání nests_fetch_nearby() v appce - appka čeká buď {"nests": [...]}
-    nebo rovnou list, a v každé položce používá jen lat/lon/type/hive_type/note."""
+    """Vrátí appce hlášení hnízd/úlů poblíž zadaného bodu (GET /nests?lat=..&lon=..&radius_km=..
+    &username=..&device_id=..). Přesně odpovídá volání nests_fetch_nearby() v appce - appka čeká
+    buď {"nests": [...]} nebo rovnou list, a v každé položce používá lat/lon/type/hive_type/note.
+    Nepovinné username/device_id se použijí jen k označení "mine": true u vlastních hlášení
+    (aby appka mohla u nich nabídnout mazání) - jiným uživatelům se cizí username/device_id
+    v odpovědi neposílá, jen id a viditelná data hlášení."""
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     radius_km = request.args.get("radius_km", default=3.0, type=float)
+    req_username = (request.args.get("username") or "").strip() or None
+    req_device_id = (request.args.get("device_id") or "").strip() or None
     if lat is None or lon is None:
         return jsonify({"status": "error", "message": "Chybí lat/lon"}), 400
 
@@ -242,14 +247,44 @@ def nests_get():
         except (TypeError, ValueError, KeyError):
             continue
         if _haversine_km(lat, lon, r_lat, r_lon) <= radius_km:
+            mine = bool((req_username and r.get("username") == req_username) or
+                        (req_device_id and r.get("device_id") == req_device_id))
             out.append({
+                "id": r.get("id"),
                 "lat": r_lat,
                 "lon": r_lon,
                 "type": r.get("type"),
                 "hive_type": r.get("hive_type"),
                 "note": r.get("note"),
+                "mine": mine,
             })
     return jsonify({"nests": out}), 200
+
+
+@app.route("/nests/delete", methods=["POST"])
+def nests_delete():
+    """Smaže vlastní hlášení (POST /nests/delete, JSON: id, username, device_id). Smazat
+    jde jen hlášení, které patří volajícímu - podle shody username, nebo když username
+    chybí/nesedí, podle shody device_id (stejné zařízení, co hlášení vytvořilo)."""
+    data = request.get_json(force=True, silent=True) or {}
+    nest_id = data.get("id")
+    username = (data.get("username") or "").strip() or None
+    device_id = (data.get("device_id") or "").strip() or None
+    if nest_id is None:
+        return jsonify({"ok": False, "reason": "Chybí id hlášení."}), 400
+
+    res = supabase.table(TABLE_NESTS).select("*").eq("id", nest_id).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return jsonify({"ok": False, "reason": "Hlášení už neexistuje."}), 404
+    row = rows[0]
+
+    owns = (username and row.get("username") == username) or (device_id and row.get("device_id") == device_id)
+    if not owns:
+        return jsonify({"ok": False, "reason": "Tohle hlášení není tvoje."}), 403
+
+    supabase.table(TABLE_NESTS).delete().eq("id", nest_id).execute()
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/nests", methods=["POST"])
