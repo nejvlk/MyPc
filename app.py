@@ -95,10 +95,22 @@ def _check_admin(data):
     return data.get("admin_pwd") == ADMIN_PWD
 
 
+def _is_active_iso(iso_str, now):
+    if not iso_str:
+        return False
+    try:
+        return datetime.fromisoformat(iso_str) > now
+    except Exception:
+        return False
+
+
 # ===========================================================================
 # EVENT SYSTÉM - in-memory (resetuje se při restartu serveru)
 # ===========================================================================
 _active_event = {}
+_event_history = []   # in-memory log eventů - resetuje se při restartu serveru
+_motd_state = {"message": "", "active": False}
+_broadcast_log = []    # in-memory log broadcastů - resetuje se při restartu serveru
 
 
 def _get_active_event_info():
@@ -138,10 +150,26 @@ def admin_set_event():
             "multiplier": mult,
             "ends_at": _time_mod.time() + dur_min * 60,
         })
+        _event_history.insert(0, {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": typ,
+            "multiplier": mult,
+            "duration": dur_min,
+            "admin": "admin",
+        })
+        del _event_history[200:]
     else:
         _active_event["type"] = "none"
 
     return jsonify({"status": "success", **_get_active_event_info()}), 200
+
+
+@app.route("/admin/event-history", methods=["POST"])
+def admin_event_history():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    return jsonify({"status": "success", "history": _event_history}), 200
 
 
 # ===========================================================================
@@ -525,6 +553,193 @@ def admin_approve_admin():
     d["admin_pending"] = False
     supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
     return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/add-currency", methods=["POST"])
+def admin_add_currency():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+    ctype = data.get("type", "coins")
+    if ctype not in ("coins", "emeralds"):
+        return jsonify({"status": "error", "message": "Neplatný typ měny"}), 400
+    try:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Neplatná částka"}), 400
+    d = row.get("data") or {}
+    current = float(d.get(ctype, 0.0))
+    d[ctype] = round(max(0.0, current + amount), 2)
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "user": row["username"], ctype: d[ctype]}), 200
+
+
+@app.route("/admin/set-level", methods=["POST"])
+def admin_set_level():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+    try:
+        level = int(data.get("level", 1))
+        xp = int(data.get("xp", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Neplatný level/XP"}), 400
+    d = row.get("data") or {}
+    d["level"] = max(1, level)
+    d["xp"] = max(0, xp)
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "user": row["username"], "level": d["level"], "xp": d["xp"]}), 200
+
+
+@app.route("/admin/bulk-reward", methods=["POST"])
+def admin_bulk_reward():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    rtype = data.get("type", "coins")
+    if rtype not in ("coins", "emeralds", "xp"):
+        return jsonify({"status": "error", "message": "Neplatný typ odměny"}), 400
+    try:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Neplatná částka"}), 400
+    if amount <= 0:
+        return jsonify({"status": "error", "message": "Částka musí být kladná"}), 400
+    res = supabase.table(TABLE).select("*").execute()
+    count = 0
+    for row in res.data or []:
+        d = row.get("data") or {}
+        current = float(d.get(rtype, 0.0))
+        d[rtype] = round(current + amount, 2) if rtype != "xp" else int(current + amount)
+        supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+        count += 1
+    return jsonify({"status": "success", "users_affected": count}), 200
+
+
+@app.route("/admin/set-score", methods=["POST"])
+def admin_set_score():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+    try:
+        score = int(data.get("score", 0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Neplatné skóre"}), 400
+    d = row.get("data") or {}
+    d["score"] = score
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "user": row["username"], "score": score}), 200
+
+
+@app.route("/admin/set-vip", methods=["POST"])
+def admin_set_vip():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+    tier = data.get("tier", "none")
+    far_future = "2099-01-01T00:00:00"
+    d = row.get("data") or {}
+    if tier == "vip":
+        d["vip_until"] = far_future
+        d["vip_plus_until"] = None
+    elif tier == "vip+":
+        d["vip_plus_until"] = far_future
+    elif tier == "none":
+        d["vip_until"] = None
+        d["vip_plus_until"] = None
+    else:
+        return jsonify({"status": "error", "message": "Neplatný tier"}), 400
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "user": row["username"],
+                     "vip_until": d.get("vip_until"),
+                     "vip_plus_until": d.get("vip_plus_until")}), 200
+
+
+@app.route("/admin/vip-list", methods=["POST"])
+def admin_vip_list():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    res = supabase.table(TABLE).select("*").execute()
+    now = datetime.now()
+    out = []
+    for row in res.data or []:
+        d = row.get("data") or {}
+        if _is_active_iso(d.get("vip_plus_until"), now):
+            out.append({"username": row["username"], "tier": "VIP+", "expiry": d.get("vip_plus_until")})
+        elif _is_active_iso(d.get("vip_until"), now):
+            out.append({"username": row["username"], "tier": "VIP", "expiry": d.get("vip_until")})
+    return jsonify({"status": "success", "vip_users": out}), 200
+
+
+@app.route("/admin/broadcast", methods=["POST"])
+def admin_broadcast():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    msg = str(data.get("message", "")).strip()
+    if not msg:
+        return jsonify({"status": "error", "message": "Zpráva je prázdná"}), 400
+    _broadcast_log.insert(0, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "message": msg})
+    del _broadcast_log[200:]
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/set-motd", methods=["POST"])
+def admin_set_motd():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    _motd_state["message"] = str(data.get("message", ""))
+    _motd_state["active"] = bool(data.get("active", False))
+    return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/get-motd", methods=["POST"])
+def admin_get_motd():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    return jsonify({"status": "success", **_motd_state}), 200
+
+
+@app.route("/admin/stats", methods=["POST"])
+def admin_stats():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    res = supabase.table(TABLE).select("*").execute()
+    rows = res.data or []
+    total_users = len(rows)
+    levels = [int((r.get("data") or {}).get("level", 1)) for r in rows]
+    avg_level = round(sum(levels) / len(levels), 1) if levels else 0
+    total_coins = round(sum(float((r.get("data") or {}).get("coins", 0.0)) for r in rows), 2)
+    total_emeralds = round(sum(float((r.get("data") or {}).get("emeralds", 0.0)) for r in rows), 2)
+    top = sorted(rows, key=lambda r: float((r.get("data") or {}).get("coins", 0.0)), reverse=True)[:10]
+    top_user = top[0]["username"] if top else "–"
+    top_users = [{"user": r["username"], "logins": "–", "last": "–"} for r in top]
+    return jsonify({
+        "status": "success",
+        "online_today": "–",
+        "total_users": total_users,
+        "avg_level": avg_level,
+        "top_user": top_user,
+        "total_coins": total_coins,
+        "total_emeralds": total_emeralds,
+        "top_users": top_users,
+    }), 200
 
 
 @app.route("/admin/remove-coins", methods=["POST"])
