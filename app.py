@@ -436,6 +436,7 @@ def admin_users():
             "phone": d.get("phone", ""),
             "banned": bool(d.get("banned", False)),
             "is_admin": bool(d.get("is_admin", False)),
+            "coins": float(d.get("coins", 0.0)),
         }
     return jsonify({"status": "success", "users": out}), 200
 
@@ -524,6 +525,27 @@ def admin_approve_admin():
     d["admin_pending"] = False
     supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
     return jsonify({"status": "success"}), 200
+
+
+@app.route("/admin/remove-coins", methods=["POST"])
+def admin_remove_coins():
+    data = request.get_json(force=True, silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"status": "error", "message": "Špatné admin heslo"}), 401
+    row = _get_row(data.get("user", ""))
+    if not row:
+        return jsonify({"status": "error", "message": "Uživatel nenalezen"}), 404
+    try:
+        amount = float(data.get("amount", 0.0))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Neplatná částka"}), 400
+    if amount <= 0:
+        return jsonify({"status": "error", "message": "Částka musí být kladné číslo"}), 400
+    d = row.get("data") or {}
+    current = float(d.get("coins", 0.0))
+    d["coins"] = round(max(0.0, current - amount), 2)
+    supabase.table(TABLE).update({"data": d}).eq("username", row["username"]).execute()
+    return jsonify({"status": "success", "user": row["username"], "coins": d["coins"]}), 200
 
 
 if __name__ == "__main__":
